@@ -43,13 +43,14 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+import struct
 
 # -------- Configuration --------
 # Either edit this value, or leave it as None and set the matching
 # FORWARDER_API_URL environment variable.
 API_URL = "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest"
 
-UDP_HOST = "0.0.0.0"   # Listen on all interfaces (Speedgoat + loopback for testing)
+UDP_HOST = "192.168.7.7"   # Listen on all interfaces (Speedgoat + loopback for testing)
 UDP_PORT = 5005        # UDP port the simulation will send to
 UDP_BUFFER_SIZE = 65535
 HTTP_TIMEOUT_S = 5     # Don't let a slow API call back up the UDP queue
@@ -123,8 +124,17 @@ def udp_receiver() -> None:
             log.error(f"UDP socket error: {e}")
             continue
 
+    # sock.sendto(json.dumps(payload).encode("utf-8"), (UDP_HOST, UDP_PORT))
+
         try:
-            data = json.loads(raw.decode("utf-8").strip())
+            v1, p1, v2, p2 = struct.unpack('<dddd', raw)
+            data = {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "devices": [
+                    {"id": "bus01", "voltage": v1, "power": p1},
+                    {"id": "bus02", "voltage": v2, "power": p2},
+                ],
+            }
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             log.warning(f"Bad packet from {addr}: {e}")
             continue
