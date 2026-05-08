@@ -13,16 +13,15 @@ Usage:
     python test_sender_burst.py
 """
  
-import json
 import socket
+import struct
 import time
-from datetime import datetime, timezone
  
 UDP_HOST = "127.0.0.1"
 UDP_PORT = 5005
  
 RATE_HZ          = 5     # packets per second
-DURATION_S       = 20    # how long to send for
+DURATION_S       = 60    # how long to send for
 TOTAL_PACKETS    = RATE_HZ * DURATION_S
 SEND_INTERVAL_S  = 1.0 / RATE_HZ
  
@@ -41,15 +40,12 @@ for i in range(TOTAL_PACKETS):
         time.sleep(sleep_for)
     next_send += SEND_INTERVAL_S
  
-    payload = {
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "packetNumber": i + 1,  # makes it easy to see which one made it through
-        "devices": [
-            {"id": "bus01", "voltage": 380.0 + i * 0.05, "power": 1939 + i},
-            {"id": "bus02", "voltage": 380.0 - i * 0.05, "power": 1861 - i},
-        ],
-    }
-    sock.sendto(json.dumps(payload).encode("utf-8"), (UDP_HOST, UDP_PORT))
+    v1 = 380.0 + (i * 500) * 0.05
+    p1 = float(1939 + i)
+    v2 = 380.0 + (i * 500) * 0.05
+    p2 = float(1861 - i)
+    payload = struct.pack('<dddd', v1, p1, v2, p2)
+    sock.sendto(payload, (UDP_HOST, UDP_PORT))
     if (i + 1) % RATE_HZ == 0:
         elapsed = time.monotonic() - start
         print(f"  t={elapsed:5.2f}s  sent {i + 1}/{TOTAL_PACKETS}")

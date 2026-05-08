@@ -50,7 +50,7 @@ import struct
 # FORWARDER_API_URL environment variable.
 API_URL = "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest"
 
-UDP_HOST = "192.168.7.7"   # Listen on all interfaces (Speedgoat + loopback for testing)
+UDP_HOST = "0.0.0.0"       # Listen on all interfaces (Speedgoat + loopback for testing)
 UDP_PORT = 5005        # UDP port the simulation will send to
 UDP_BUFFER_SIZE = 65535
 HTTP_TIMEOUT_S = 5     # Don't let a slow API call back up the UDP queue
@@ -135,7 +135,7 @@ def udp_receiver() -> None:
                     {"id": "bus02", "voltage": v2, "power": p2},
                 ],
             }
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        except (struct.error, UnicodeDecodeError, json.JSONDecodeError) as e:
             log.warning(f"Bad packet from {addr}: {e}")
             continue
 
