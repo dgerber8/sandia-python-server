@@ -28,8 +28,9 @@ agreed-upon format:
     {
         "timestamp": "2025-05-04T12:34:56Z",
         "devices": [
-            {"id": "bus01", "voltage": 380.2, "power": 1939},
-            {"id": "bus02", "voltage": 379.8, "power": 1861}
+            {"id": "bus01", "voltage": 1.02, "reactive power": 1939},
+            ...
+            {"id": "bus22", "voltage": 0.98, "reactive power": 1861}
         ]
     }
 """
@@ -49,6 +50,9 @@ import struct
 # Either edit this value, or leave it as None and set the matching
 # FORWARDER_API_URL environment variable.
 API_URL = "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest"
+
+FIELDS_PER_BUS  = 3                    # voltage, active power, reactive power
+BYTES_PER_BUS   = FIELDS_PER_BUS * 8  # each double is 8 bytes
 
 UDP_HOST = "0.0.0.0"       # Listen on all interfaces (Speedgoat + loopback for testing)
 UDP_PORT = 5005        # UDP port the simulation will send to
@@ -126,14 +130,25 @@ def udp_receiver() -> None:
 
     # sock.sendto(json.dumps(payload).encode("utf-8"), (UDP_HOST, UDP_PORT))
 
+        n_bytes = len(raw)
+        if n_bytes == 0 or n_bytes % BYTES_PER_BUS != 0:
+            log.warning(f"Bad packet from {addr}: size {n_bytes} not divisible by {BYTES_PER_BUS}")
+            continue
+        n_buses = n_bytes // BYTES_PER_BUS
         try:
-            v1, p1, v2, p2 = struct.unpack('<dddd', raw)
+            values = struct.unpack("<" + "ddd" * n_buses, raw)
+            devices = [
+                {
+                    "id": f"bus{b + 1:02d}",
+                    "voltage":        values[b * FIELDS_PER_BUS],
+                    "active power":   values[b * FIELDS_PER_BUS + 1],
+                    "reactive power": values[b * FIELDS_PER_BUS + 2],
+                }
+                for b in range(n_buses)
+            ]
             data = {
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "devices": [
-                    {"id": "bus01", "voltage": v1, "power": p1},
-                    {"id": "bus02", "voltage": v2, "power": p2},
-                ],
+                "devices": devices,
             }
         except (struct.error, UnicodeDecodeError, json.JSONDecodeError) as e:
             log.warning(f"Bad packet from {addr}: {e}")
