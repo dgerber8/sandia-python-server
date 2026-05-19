@@ -19,9 +19,6 @@ Packet format (little-endian, identical on both ports):
                         id_len bytes  UTF-8 PV name
                 <dd     active P, reactive P
 
-To add a bus or PV, update BUS_IDS or PV_NAMES and adjust the split index.
-No forwarder changes required.
-
 Usage:
     python multi_port_test_sender.py
 """
