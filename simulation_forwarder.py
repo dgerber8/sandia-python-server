@@ -1,41 +1,30 @@
 """
-Simulation Data Forwarder (multi-port)
-=======================================
+Simulation Data Forwarder (dual-port, unified format)
+======================================================
 
-Receives simulation data from the simulator over UDP on *two* ports and POSTs
-the most recent merged snapshot to a remote API Gateway endpoint over HTTPS on
-a fixed 5-second interval.
+Receives simulation data on *two* UDP ports, each carrying the same packet
+structure (buses + PVSystems for its half of the network), then merges both
+into a single JSON body and POSTs it to the API Gateway every 5 seconds.
 
 Architecture:
-    Sim Computer  --UDP:5005 (buses)----+
-                                        +-->  This Script  --HTTPS POST-->  API Gateway
-    Sim Computer  --UDP:5006 (PVs)------+
+    Sim Computer  --UDP:5005 (buses 1-11  + PVs  0-16)--+
+                                                          +--> This Script --> API Gateway
+    Sim Computer  --UDP:5006 (buses 12-22 + PVs 17-34)--+
 
-Per-port behavior:
-    - Each port has its own listener thread; the most recent packet for that
-      topic is cached. Older packets are silently dropped.
-    - Both packets carry their own timestamp (an epoch-seconds double in the
-      header). The forwarder converts to ISO before sending.
+Packet format (little-endian, identical on both ports):
+    header  <dII      timestamp_epoch_s (double), bus_count (uint32), pv_count (uint32)
+    body    bus_count × <dddddd   voltage, active P, reactive P, face0, face1, face2
+            pv_count  × <dd       active P, reactive P
 
 POST tick (every POST_INTERVAL_S):
-    - Whatever is cached for each topic is merged into one JSON body:
-        { timestamp, devices?, PVSystems? }
-    - If a topic hasn't received anything since the last tick, that field is
-      omitted. If neither has, nothing is sent.
-
-Packet formats (little-endian throughout):
-
-    Bus port 5005:
-        header  <dI       timestamp_epoch_s, bus_count
-        body    bus_count × <dddddd  voltage, active P, reactive P, face0, face1, face2
-
-    PV port 5006:
-        header  <dI       timestamp_epoch_s, pv_count
-        body    pv_count  × <dd      active P, reactive P
-        (id resolved by index against PV_NAMES below)
+    - Grabs the latest packet cached for each port.
+    - Merges their devices lists and PVSystems lists into one payload.
+    - If neither port has received anything since the last tick, nothing is sent.
 
 Configuration:
     Set API_URL below, OR set FORWARDER_API_URL in the environment.
+    PORT_A/B_BUS_ID_START and PORT_A/B_PV_ID_START must match whatever the
+    sender uses to split the data.
 
 Usage:
     python simulation_forwarder.py
@@ -56,25 +45,28 @@ from datetime import datetime, timezone
 API_URL = "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest"
 
 UDP_HOST        = "0.0.0.0"
-BUS_PORT        = 5005
-PV_PORT         = 5006
+PORT_A          = 5005   # first half:  buses 1-11,  PVs index 0-16
+PORT_B          = 5006   # second half: buses 12-22, PVs index 17-34
 UDP_BUFFER_SIZE = 65535
 HTTP_TIMEOUT_S  = 5
 POST_INTERVAL_S = 5.0
 
-# ── Bus packet layout ────────────────────────────────────────────────────────
-BUS_HEADER_FMT   = "<dI"                 # timestamp (epoch s), bus_count
-BUS_HEADER_BYTES = struct.calcsize(BUS_HEADER_FMT)
-FIELDS_PER_BUS   = 6                     # voltage, active P, reactive P, face[0..2]
-BYTES_PER_BUS    = FIELDS_PER_BUS * 8
+# Starting offsets so bus IDs and PV names are assigned correctly when merging.
+# PORT_B offsets must equal however many buses/PVs port A carries per packet.
+PORT_A_BUS_ID_START = 0   # bus IDs become bus01 .. bus11
+PORT_B_BUS_ID_START = 11  # bus IDs become bus12 .. bus22
+PORT_A_PV_ID_START  = 0   # PV_NAMES[0..16]
+PORT_B_PV_ID_START  = 17  # PV_NAMES[17..34]
 
-# ── PV packet layout ─────────────────────────────────────────────────────────
-PV_HEADER_FMT    = "<dI"                 # timestamp (epoch s), pv_count
-PV_HEADER_BYTES  = struct.calcsize(PV_HEADER_FMT)
-FIELDS_PER_PV    = 2                     # active P, reactive P
-BYTES_PER_PV     = FIELDS_PER_PV * 8
+# ── Packet layout ─────────────────────────────────────────────────────────────
+COMBINED_HEADER_FMT   = "<dII"   # timestamp_epoch_s, bus_count, pv_count
+COMBINED_HEADER_BYTES = struct.calcsize(COMBINED_HEADER_FMT)
+FIELDS_PER_BUS        = 6        # voltage, active P, reactive P, face0, face1, face2
+BYTES_PER_BUS         = FIELDS_PER_BUS * 8
+FIELDS_PER_PV         = 2        # active P, reactive P
+BYTES_PER_PV          = FIELDS_PER_PV * 8
 
-# PVSystem id order — index in the wire format maps to this list.
+# PV name order — index in the wire format maps to this list.
 PV_NAMES = [
     "PVSystem.PVSY19",  "PVSystem.PVSY35",
     "PVSystem.PVSY291", "PVSystem.PVSY292", "PVSystem.PVSY293",
@@ -97,16 +89,17 @@ log = logging.getLogger("forwarder")
 # ── Shared state ─────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
 
-# Per-topic cache. Each holds the most recent parsed dict ready to merge into
-# a POST body. Cleared after every POST tick.
-_latest_bus_packet: dict | None = None     # { "timestamp": "...", "devices": [...] }
-_latest_pv_packet:  dict | None = None     # { "timestamp": "...", "PVSystems": [...] }
+# Latest parsed snapshot per port. Each dict has the shape:
+#   { "timestamp": "<ISO>", "devices": [...], "PVSystems": [...] }
+# Cleared to None after every POST tick.
+_latest_a_packet: dict | None = None
+_latest_b_packet: dict | None = None
 
-# Per-topic counters reported once per POST tick for diagnostics.
-_bus_received = 0
-_bus_dropped  = 0
-_pv_received  = 0
-_pv_dropped   = 0
+# Diagnostic counters (never reset, reported each tick).
+_a_received = 0
+_a_dropped  = 0
+_b_received = 0
+_b_dropped  = 0
 
 _stop_event = threading.Event()
 
@@ -121,7 +114,6 @@ def resolve_config() -> str:
 
 
 def epoch_to_iso(t: float) -> str:
-    """Convert an epoch-seconds double to the ISO-8601 string the API expects."""
     return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -129,79 +121,99 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── Packet parsers ───────────────────────────────────────────────────────────
+# ── Packet parser ─────────────────────────────────────────────────────────────
 
-def parse_bus_packet(raw: bytes, addr) -> dict | None:
+def parse_combined_packet(
+    raw: bytes,
+    addr,
+    bus_id_start: int,
+    pv_id_start: int,
+) -> "dict | None":
+    """
+    Parse a combined bus+PV binary packet.
+
+    bus_id_start: added to the in-packet bus index to form the bus ID string
+                  (e.g. bus_id_start=11 → first bus in packet becomes bus12)
+    pv_id_start:  index into PV_NAMES for the first PV in this packet
+    """
     n_bytes = len(raw)
-    if n_bytes < BUS_HEADER_BYTES:
-        log.warning(f"Bad bus packet from {addr}: {n_bytes} bytes < header {BUS_HEADER_BYTES}")
+    if n_bytes < COMBINED_HEADER_BYTES:
+        log.warning(f"Bad packet from {addr}: {n_bytes} bytes < header {COMBINED_HEADER_BYTES}")
         return None
+
     try:
-        ts_s, n_buses = struct.unpack(BUS_HEADER_FMT, raw[:BUS_HEADER_BYTES])
-        expected = BUS_HEADER_BYTES + n_buses * BYTES_PER_BUS
-        if n_bytes != expected:
-            log.warning(f"Bad bus packet from {addr}: size {n_bytes} ≠ expected {expected} (buses={n_buses})")
-            return None
-        bus_values = struct.unpack("<" + "dddddd" * n_buses, raw[BUS_HEADER_BYTES:])
-        devices = [
-            {
-                "id": f"bus{b + 1:02d}",
-                "voltage":        bus_values[b * FIELDS_PER_BUS],
-                "active power":   bus_values[b * FIELDS_PER_BUS + 1],
-                "reactive power": bus_values[b * FIELDS_PER_BUS + 2],
-                "faces": [
-                    bus_values[b * FIELDS_PER_BUS + 3],
-                    bus_values[b * FIELDS_PER_BUS + 4],
-                    bus_values[b * FIELDS_PER_BUS + 5],
-                ],
-            }
-            for b in range(n_buses)
-        ]
-        return {"timestamp": epoch_to_iso(ts_s), "devices": devices}
+        ts_s, n_buses, n_pvs = struct.unpack(COMBINED_HEADER_FMT, raw[:COMBINED_HEADER_BYTES])
     except struct.error as e:
-        log.warning(f"Bad bus packet from {addr}: {e}")
+        log.warning(f"Bad header from {addr}: {e}")
         return None
 
-
-def parse_pv_packet(raw: bytes, addr) -> dict | None:
-    n_bytes = len(raw)
-    if n_bytes < PV_HEADER_BYTES:
-        log.warning(f"Bad pv packet from {addr}: {n_bytes} bytes < header {PV_HEADER_BYTES}")
+    expected = COMBINED_HEADER_BYTES + n_buses * BYTES_PER_BUS + n_pvs * BYTES_PER_PV
+    if n_bytes != expected:
+        log.warning(
+            f"Bad packet from {addr}: size {n_bytes} != expected {expected} "
+            f"(buses={n_buses}, pvs={n_pvs})"
+        )
         return None
+
     try:
-        ts_s, n_pvs = struct.unpack(PV_HEADER_FMT, raw[:PV_HEADER_BYTES])
-        expected = PV_HEADER_BYTES + n_pvs * BYTES_PER_PV
-        if n_bytes != expected:
-            log.warning(f"Bad pv packet from {addr}: size {n_bytes} ≠ expected {expected} (pvs={n_pvs})")
-            return None
-        pv_values = struct.unpack("<" + "dd" * n_pvs, raw[PV_HEADER_BYTES:])
-        pvsystems = [
-            {
-                "id":             PV_NAMES[p] if p < len(PV_NAMES) else f"PVSystem.UNKNOWN{p}",
-                "active power":   pv_values[p * FIELDS_PER_PV],
-                "reactive power": pv_values[p * FIELDS_PER_PV + 1],
-            }
-            for p in range(n_pvs)
-        ]
-        return {"timestamp": epoch_to_iso(ts_s), "PVSystems": pvsystems}
+        bus_offset = COMBINED_HEADER_BYTES
+        bus_values = struct.unpack(
+            "<" + "dddddd" * n_buses,
+            raw[bus_offset : bus_offset + n_buses * BYTES_PER_BUS],
+        )
+
+        pv_offset = bus_offset + n_buses * BYTES_PER_BUS
+        pv_values = struct.unpack(
+            "<" + "dd" * n_pvs,
+            raw[pv_offset : pv_offset + n_pvs * BYTES_PER_PV],
+        )
     except struct.error as e:
-        log.warning(f"Bad pv packet from {addr}: {e}")
+        log.warning(f"Bad packet body from {addr}: {e}")
         return None
 
+    devices = [
+        {
+            "id":             f"bus{bus_id_start + b + 1:02d}",
+            "voltage":        bus_values[b * FIELDS_PER_BUS],
+            "active power":   bus_values[b * FIELDS_PER_BUS + 1],
+            "reactive power": bus_values[b * FIELDS_PER_BUS + 2],
+            "faces": [
+                bus_values[b * FIELDS_PER_BUS + 3],
+                bus_values[b * FIELDS_PER_BUS + 4],
+                bus_values[b * FIELDS_PER_BUS + 5],
+            ],
+        }
+        for b in range(n_buses)
+    ]
 
-# ── UDP receiver loop (generic over topic) ───────────────────────────────────
+    pvsystems = [
+        {
+            "id":             PV_NAMES[pv_id_start + p] if (pv_id_start + p) < len(PV_NAMES)
+                              else f"PVSystem.UNKNOWN{pv_id_start + p}",
+            "active power":   pv_values[p * FIELDS_PER_PV],
+            "reactive power": pv_values[p * FIELDS_PER_PV + 1],
+        }
+        for p in range(n_pvs)
+    ]
 
-def udp_receiver(port: int, topic: str, parser) -> None:
-    """Continuously receive UDP packets on `port` and cache the latest one for `topic`."""
-    global _latest_bus_packet, _latest_pv_packet
-    global _bus_received, _bus_dropped, _pv_received, _pv_dropped
+    return {
+        "timestamp": epoch_to_iso(ts_s),
+        "devices":   devices,
+        "PVSystems": pvsystems,
+    }
+
+
+# ── UDP receiver loop ────────────────────────────────────────────────────────
+
+def udp_receiver(port: int, topic: str, bus_id_start: int, pv_id_start: int) -> None:
+    """Receive UDP packets on `port` and cache the most recent parsed snapshot."""
+    global _latest_a_packet, _latest_b_packet
+    global _a_received, _a_dropped, _b_received, _b_dropped
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_HOST, port))
-    # Short timeout so we can periodically check the stop flag instead of
-    # blocking forever in recvfrom (which would ignore Ctrl+C on Windows).
-    sock.settimeout(0.5)
-    log.info(f"UDP {topic} listener bound to {UDP_HOST}:{port}")
+    sock.settimeout(0.5)   # allows the stop flag to be checked periodically
+    log.info(f"UDP port {port} ({topic}) listener bound to {UDP_HOST}:{port}")
 
     while not _stop_event.is_set():
         try:
@@ -212,26 +224,26 @@ def udp_receiver(port: int, topic: str, parser) -> None:
             log.error(f"UDP {topic} socket error: {e}")
             continue
 
-        parsed = parser(raw, addr)
+        parsed = parse_combined_packet(raw, addr, bus_id_start, pv_id_start)
         if parsed is None:
             continue
 
         with _state_lock:
-            if topic == "bus":
-                if _latest_bus_packet is not None:
-                    _bus_dropped += 1
-                _latest_bus_packet = parsed
-                _bus_received += 1
-            else:  # "pv"
-                if _latest_pv_packet is not None:
-                    _pv_dropped += 1
-                _latest_pv_packet = parsed
-                _pv_received += 1
+            if topic == "a":
+                if _latest_a_packet is not None:
+                    _a_dropped += 1
+                _latest_a_packet = parsed
+                _a_received += 1
+            else:
+                if _latest_b_packet is not None:
+                    _b_dropped += 1
+                _latest_b_packet = parsed
+                _b_received += 1
 
     sock.close()
 
 
-# ── POST timer ───────────────────────────────────────────────────────────────
+# ── POST logic ───────────────────────────────────────────────────────────────
 
 def post_payload(url: str, payload: dict) -> None:
     body = json.dumps(payload).encode("utf-8")
@@ -255,8 +267,8 @@ def post_payload(url: str, payload: dict) -> None:
 
 
 def post_timer(api_url: str) -> None:
-    """Every POST_INTERVAL_S, merge the latest bus + PV caches into one body and POST."""
-    global _latest_bus_packet, _latest_pv_packet
+    """Every POST_INTERVAL_S, merge the latest snapshots from both ports and POST."""
+    global _latest_a_packet, _latest_b_packet
 
     next_tick = time.monotonic() + POST_INTERVAL_S
     while not _stop_event.is_set():
@@ -267,30 +279,38 @@ def post_timer(api_url: str) -> None:
         next_tick += POST_INTERVAL_S
 
         with _state_lock:
-            bus_packet = _latest_bus_packet
-            pv_packet  = _latest_pv_packet
-            _latest_bus_packet = None
-            _latest_pv_packet  = None
-            br, bd = _bus_received, _bus_dropped
-            pr, pd = _pv_received,  _pv_dropped
+            pkt_a = _latest_a_packet
+            pkt_b = _latest_b_packet
+            _latest_a_packet = None
+            _latest_b_packet = None
+            ar, ad = _a_received, _a_dropped
+            br, bd = _b_received, _b_dropped
 
-        if bus_packet is None and pv_packet is None:
+        if pkt_a is None and pkt_b is None:
             log.info("Tick: no new packets on either port")
             continue
 
-        payload: dict = {}
-        if bus_packet:
-            payload["devices"]   = bus_packet["devices"]
-        if pv_packet:
-            payload["PVSystems"] = pv_packet["PVSystems"]
+        # Merge both ports' lists — order is A then B so IDs stay sorted.
+        all_devices   = []
+        all_pvsystems = []
+        for pkt in (pkt_a, pkt_b):
+            if pkt:
+                all_devices.extend(pkt.get("devices",   []))
+                all_pvsystems.extend(pkt.get("PVSystems", []))
 
-        # Use the newer of the two received timestamps as the payload timestamp;
-        # if neither topic carried one we stamp on egress.
-        candidate_ts = [p["timestamp"] for p in (bus_packet, pv_packet) if p and p.get("timestamp")]
-        payload["timestamp"] = max(candidate_ts) if candidate_ts else now_iso()
+        payload: dict = {}
+        if all_devices:
+            payload["devices"] = all_devices
+        if all_pvsystems:
+            payload["PVSystems"] = all_pvsystems
+
+        # Use the later of the two packet timestamps; fall back to now().
+        ts_candidates = [p["timestamp"] for p in (pkt_a, pkt_b) if p and p.get("timestamp")]
+        payload["timestamp"] = max(ts_candidates) if ts_candidates else now_iso()
 
         log.info(
-            f"Tick: bus={br}r/{bd}d  pv={pr}r/{pd}d  sending fields={sorted(payload.keys())}"
+            f"Tick: portA={ar}r/{ad}d  portB={br}r/{bd}d  "
+            f"buses={len(all_devices)}  pvs={len(all_pvsystems)}"
         )
         post_payload(api_url, payload)
 
@@ -301,16 +321,21 @@ def main() -> None:
     api_url = resolve_config()
     log.info(f"Forwarding to {api_url}")
     log.info(f"POST interval: {POST_INTERVAL_S} seconds")
+    log.info(f"Port A ({PORT_A}): bus_id_start={PORT_A_BUS_ID_START}, pv_id_start={PORT_A_PV_ID_START}")
+    log.info(f"Port B ({PORT_B}): bus_id_start={PORT_B_BUS_ID_START}, pv_id_start={PORT_B_PV_ID_START}")
 
-    # One receiver thread per topic/port.
     threading.Thread(
-        target=udp_receiver, args=(BUS_PORT, "bus", parse_bus_packet), daemon=True,
+        target=udp_receiver,
+        args=(PORT_A, "a", PORT_A_BUS_ID_START, PORT_A_PV_ID_START),
+        daemon=True,
     ).start()
     threading.Thread(
-        target=udp_receiver, args=(PV_PORT, "pv", parse_pv_packet), daemon=True,
+        target=udp_receiver,
+        args=(PORT_B, "b", PORT_B_BUS_ID_START, PORT_B_PV_ID_START),
+        daemon=True,
     ).start()
 
-    # Run the POST timer on the main thread so Ctrl+C works cleanly.
+    # POST timer runs on the main thread so Ctrl+C works cleanly.
     post_timer(api_url)
 
 

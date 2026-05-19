@@ -1,29 +1,25 @@
 """
-Multi-port UDP test sender.
+Multi-port UDP test sender (unified format).
 
-Emits to TWO ports at the same cadence to exercise the multi-port forwarder:
-    - UDP 127.0.0.1:5005  → bus data  (22 buses, voltage / P / Q / faces)
-    - UDP 127.0.0.1:5006  → PV system data (35 PVs, P / Q)
+Emits to TWO ports at the same cadence to exercise the multi-port forwarder.
+Both ports carry the same packet structure — each with half the buses and
+half the PVs — which the forwarder merges into one payload per tick.
 
-Both packets carry their own timestamp (an epoch-seconds double in the header)
-so the forwarder doesn't need to stamp on receipt.
+    PORT_A (5005): buses 1-11   + PVs index 0-16
+    PORT_B (5006): buses 12-22  + PVs index 17-34
 
-Same triangle-wave oscillation as the single-port `test_sender_burst` so values
-fluctuate visibly across the run. 5 packets/sec for 600 s = 3,000 packets per
-port. With the forwarder POSTing every 5 s, expect ~120 DynamoDB records.
+Packet format (little-endian, identical on both ports):
+    header  <dII      timestamp_epoch_s (double), bus_count (uint32), pv_count (uint32)
+    body    bus_count × <dddddd   voltage, active P, reactive P, face0, face1, face2
+            pv_count  × <dd       active P, reactive P
 
-Packet formats (little-endian throughout):
-
-    Bus port 5005:
-        header  <dI       timestamp_epoch_s, bus_count
-        body    bus_count × <dddddd  voltage, active P, reactive P, face0, face1, face2
-
-    PV port 5006:
-        header  <dI       timestamp_epoch_s, pv_count
-        body    pv_count  × <dd      active P, reactive P
+Same triangle-wave oscillation as test_sender_burst so values fluctuate
+visibly across the run. 5 packet pairs/sec for 600 s = 3,000 pairs.
+With the forwarder POSTing every 5 s, expect ~120 DynamoDB records each
+containing 22 devices and 35 PVSystems.
 
 Usage:
-    python test_sender_multi.py
+    python multi_port_test_sender.py
 """
 
 import socket
@@ -31,30 +27,33 @@ import struct
 import time
 
 UDP_HOST = "127.0.0.1"
-BUS_PORT = 5005
-PV_PORT  = 5006
+PORT_A   = 5005
+PORT_B   = 5006
 
-BUS_COUNT = 22
-PV_COUNT  = 35
+# ── Split configuration (must match forwarder PORT_*_BUS_ID_START / PV_ID_START) ──
+PORT_A_BUS_COUNT = 11   # buses 1-11   (bus_id_start=0  in forwarder)
+PORT_B_BUS_COUNT = 11   # buses 12-22  (bus_id_start=11 in forwarder)
+PORT_A_PV_COUNT  = 17   # PV_NAMES indices 0-16   (pv_id_start=0  in forwarder)
+PORT_B_PV_COUNT  = 18   # PV_NAMES indices 17-34  (pv_id_start=17 in forwarder)
 
-BUS_HEADER_FMT = "<dI"     # timestamp (epoch s), bus_count
-PV_HEADER_FMT  = "<dI"     # timestamp (epoch s), pv_count
-BUS_FMT        = "dddddd"  # 6 doubles per bus
-PV_FMT         = "dd"      # 2 doubles per PV
+TOTAL_BUSES = PORT_A_BUS_COUNT + PORT_B_BUS_COUNT   # 22
+TOTAL_PVS   = PORT_A_PV_COUNT  + PORT_B_PV_COUNT    # 35
 
-RATE_HZ         = 5     # packets per second per port
+HEADER_FMT = "<dII"   # timestamp_epoch_s, bus_count, pv_count
+
+RATE_HZ         = 5     # packet pairs per second
 DURATION_S      = 600   # how long to send for
 TOTAL_PACKETS   = RATE_HZ * DURATION_S
 SEND_INTERVAL_S = 1.0 / RATE_HZ
 
-bus_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-pv_sock  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-print(f"Sending {TOTAL_PACKETS} packets per port at {RATE_HZ}/s for {DURATION_S}s")
-print(f"  Bus port {BUS_PORT}: {BUS_COUNT} buses (voltage, active P, reactive P, 3 faces)")
-print(f"  PV  port {PV_PORT}: {PV_COUNT} PV systems (active P, reactive P)")
+print(f"Sending {TOTAL_PACKETS} packet pairs at {RATE_HZ}/s for {DURATION_S}s")
+print(f"  Port A ({PORT_A}): {PORT_A_BUS_COUNT} buses + {PORT_A_PV_COUNT} PVs")
+print(f"  Port B ({PORT_B}): {PORT_B_BUS_COUNT} buses + {PORT_B_PV_COUNT} PVs")
+print(f"  Merged payload:   {TOTAL_BUSES} buses + {TOTAL_PVS} PVs")
 print(f"Forwarder should POST ~{DURATION_S // 5} times "
-      f"(once every 5s, merging the latest of each topic)\n")
+      f"(once every 5s, merging the latest of each port)\n")
 
 start = time.monotonic()
 next_send = start
@@ -65,7 +64,6 @@ for i in range(TOTAL_PACKETS):
         time.sleep(sleep_for)
     next_send += SEND_INTERVAL_S
 
-    # Shared wall-clock timestamp for both ports on this tick.
     ts_epoch = time.time()
 
     # Triangle-wave oscillation: drop 5 steps then rise 5 steps, repeat.
@@ -79,40 +77,48 @@ for i in range(TOTAL_PACKETS):
         p_swing  = -(10 - cycle_pos) * 150.0
         pv_swing = -(10 - cycle_pos) * 25.0
 
-    # ── Bus packet ───────────────────────────────────────────────────────
-    bus_values = []
-    for b in range(BUS_COUNT):
+    # ── Compute values for all buses and PVs up front ─────────────────────
+    all_bus_values = []
+    for b in range(TOTAL_BUSES):
         voltage        = 1.0    + (b * 0.002) + v_swing
         active_power   = 1900.0 + (b * 50)    + p_swing
-        reactive_power = 200.0  + (b * 10)    + p_swing * 0.1  # MVAR tracks P loosely
+        reactive_power = 200.0  + (b * 10)    + p_swing * 0.1
         face0 = voltage + 0.030
         face1 = voltage - 0.025
         face2 = voltage + 0.055
-        bus_values.extend([voltage, active_power, reactive_power, face0, face1, face2])
+        all_bus_values.append((voltage, active_power, reactive_power, face0, face1, face2))
 
-    bus_payload = (
-        struct.pack(BUS_HEADER_FMT, ts_epoch, BUS_COUNT)
-        + struct.pack("<" + BUS_FMT * BUS_COUNT, *bus_values)
-    )
-    bus_sock.sendto(bus_payload, (UDP_HOST, BUS_PORT))
-
-    # ── PV packet ────────────────────────────────────────────────────────
-    pv_values = []
-    for p in range(PV_COUNT):
+    all_pv_values = []
+    for p in range(TOTAL_PVS):
         active_power   = 500.0 + (p * 8) + pv_swing
         reactive_power = 50.0  + (p * 1) + pv_swing * 0.1
-        pv_values.extend([active_power, reactive_power])
+        all_pv_values.append((active_power, reactive_power))
 
-    pv_payload = (
-        struct.pack(PV_HEADER_FMT, ts_epoch, PV_COUNT)
-        + struct.pack("<" + PV_FMT * PV_COUNT, *pv_values)
+    # ── Port A packet: first half of buses + first half of PVs ───────────
+    a_buses = all_bus_values[:PORT_A_BUS_COUNT]
+    a_pvs   = all_pv_values[:PORT_A_PV_COUNT]
+    pkt_a = (
+        struct.pack(HEADER_FMT, ts_epoch, PORT_A_BUS_COUNT, PORT_A_PV_COUNT)
+        + struct.pack("<" + "dddddd" * PORT_A_BUS_COUNT, *[v for bus in a_buses for v in bus])
+        + struct.pack("<" + "dd"     * PORT_A_PV_COUNT,  *[v for pv  in a_pvs  for v in pv])
     )
-    pv_sock.sendto(pv_payload, (UDP_HOST, PV_PORT))
+
+    # ── Port B packet: second half of buses + second half of PVs ─────────
+    b_buses = all_bus_values[PORT_A_BUS_COUNT:]
+    b_pvs   = all_pv_values[PORT_A_PV_COUNT:]
+    pkt_b = (
+        struct.pack(HEADER_FMT, ts_epoch, PORT_B_BUS_COUNT, PORT_B_PV_COUNT)
+        + struct.pack("<" + "dddddd" * PORT_B_BUS_COUNT, *[v for bus in b_buses for v in bus])
+        + struct.pack("<" + "dd"     * PORT_B_PV_COUNT,  *[v for pv  in b_pvs  for v in pv])
+    )
+
+    sock.sendto(pkt_a, (UDP_HOST, PORT_A))
+    sock.sendto(pkt_b, (UDP_HOST, PORT_B))
 
     if (i + 1) % RATE_HZ == 0:
         elapsed = time.monotonic() - start
-        print(f"  t={elapsed:5.2f}s  sent {i + 1}/{TOTAL_PACKETS} to each port")
+        print(f"  t={elapsed:5.2f}s  sent pair {i + 1}/{TOTAL_PACKETS}")
 
-bus_sock.close()
-pv_sock.close()
-print(f"\nDone. Check DynamoDB for ~{DURATION_S // 5} new records with both `devices` and `PVSystems`.")
+sock.close()
+print(f"\nDone. Check DynamoDB for ~{DURATION_S // 5} new records.")
+print(f"Each record should have {TOTAL_BUSES} devices and {TOTAL_PVS} PVSystems.")
