@@ -1,41 +1,35 @@
 """
-Simulation Data Forwarder (dual-port, self-describing format)
-=============================================================
+Jeewon Forwarder — raw 150-float UDP → API Gateway
+====================================================
 
-Receives simulation data on two UDP ports and POSTs a merged snapshot to
-the API Gateway every 5 seconds.
+Listens on a single UDP port for Jeewon's simulation output, decodes the
+fixed-layout 150-float payload, and POSTs a merged snapshot to the API
+Gateway every POST_INTERVAL_S seconds.
 
-Architecture:
-    Sim Computer  --UDP:5005--+
-                               +--> This Script --> API Gateway
-    Sim Computer  --UDP:5006--+
+Packet format (from Jeewon's model, port 5005):
+    600 bytes — 150 native-endian floats, NO header, NO IDs.
+    struct.unpack('150f', data)
 
-Packet format (little-endian, identical on both ports):
-    header      <dII    timestamp_epoch_s (double), bus_count (uint32), pv_count (uint32)
+    30 groups × 5 floats each: [VA, VB, VC, active_power, reactive_power]
 
-    per bus:    <H      id_len
-                        id_len bytes  UTF-8 bus ID (e.g. "bus01")
-                <dddddd voltage, active P, reactive P, face0, face1, face2
+    Groups 0–20  → 21 buses (bus01–bus19, bus21, bus22 — note: bus20 absent)
+    Groups 21–29 → 9 PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
 
-    per PV:     <H      id_len
-                        id_len bytes  UTF-8 PV name (e.g. "PVSystem.PVSY19")
-                <dd     active P, reactive P
-
-Because each entry carries its own ID, the forwarder has no knowledge of
-the network topology. Adding ports, buses, or PVs only requires changes to
-the sender — nothing here needs to change.
+Bus voltage reported to the API is mean(VA, VB, VC).
+Faces [VA, VB, VC] are forwarded as-is.
+No Loads in Jeewon's format — the "Loads" key is omitted from the POST.
 
 POST tick (every POST_INTERVAL_S):
-    - Grabs the latest parsed snapshot for each port.
-    - Concatenates their devices and PVSystems lists (A then B).
-    - Skips the tick if neither port received anything since the last one.
+    - Grabs the latest parsed snapshot.
+    - Skips the tick if no new packet arrived since the last one.
 
 Configuration:
-    API_URL   Target endpoint (or set FORWARDER_API_URL env var).
-    PORT_A/B  UDP ports to listen on.
+    API_URL          Target endpoint (or set FORWARDER_API_URL env var).
+    UDP_PORT         Port to listen on (default 5005).
+    POST_INTERVAL_S  How often to POST (default 5 s).
 
 Usage:
-    python simulation_forwarder.py
+    python jeewon_forwarder.py
 """
 
 import json
@@ -49,127 +43,135 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-# ── Configuration ────────────────────────────────────────────────────────────
-API_URL = "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest"
+# ── Configuration ─────────────────────────────────────────────────────────────
+API_URL = os.environ.get(
+    "FORWARDER_API_URL",
+    "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest",
+)
 
 UDP_HOST        = "0.0.0.0"
-PORT_A          = 5005
-PORT_B          = 5006
+UDP_PORT        = 5005
 UDP_BUFFER_SIZE = 65535
 HTTP_TIMEOUT_S  = 5
 POST_INTERVAL_S = 5.0
 
-# ── Packet layout ─────────────────────────────────────────────────────────────
-HEADER_FMT   = "<dII"                    # timestamp_epoch_s, bus_count, pv_count
-HEADER_BYTES = struct.calcsize(HEADER_FMT)
-BUS_FMT      = "<dddddd"                 # voltage, active P, reactive P, face0, face1, face2
-BUS_BYTES    = struct.calcsize(BUS_FMT)
-PV_FMT       = "<dd"                     # active P, reactive P
-PV_BYTES     = struct.calcsize(PV_FMT)
+# ── Fixed packet layout ───────────────────────────────────────────────────────
+# 150 native-endian single-precision floats, 600 bytes total, no header.
+FLOAT_COUNT   = 150
+PACKET_BYTES  = FLOAT_COUNT * struct.calcsize("f")  # 600
+FLOATS_FMT    = f"{FLOAT_COUNT}f"                   # '150f'  (native endian)
+
+# Bus group mapping: group index → API bus ID
+# Groups 0–18: bus01–bus19; groups 19–20: bus21–bus22 (bus20 is absent)
+BUS_GROUPS = [
+    (0,  "bus01"), (1,  "bus02"), (2,  "bus03"), (3,  "bus04"), (4,  "bus05"),
+    (5,  "bus06"), (6,  "bus07"), (7,  "bus08"), (8,  "bus09"), (9,  "bus10"),
+    (10, "bus11"), (11, "bus12"), (12, "bus13"), (13, "bus14"), (14, "bus15"),
+    (15, "bus16"), (16, "bus17"), (17, "bus18"), (18, "bus19"),
+    (19, "bus21"),  # bus20 is absent in Jeewon's format
+    (20, "bus22"),
+]
+
+# PV group mapping: group index → PV system ID sent to the API.
+# ⚠  Update these names to match the exact PVSystem IDs used in your
+#    OpenDSS model / DynamoDB records if they differ.
+PV_GROUPS = [
+    (21, "PVSystem.PVSY19"),
+    (22, "PVSystem.PVSY303"),
+    (23, "PVSystem.PVSY321"),
+    (24, "PVSystem.PVSY306"),
+    (25, "PVSystem.PVSY294"),
+    (26, "PVSystem.PVSY318"),
+    (27, "PVSystem.PVSY291"),
+    (28, "PVSystem.PVSY315"),
+    (29, "PVSystem.PVSY297"),
+]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("forwarder")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("jeewon_forwarder")
 
 # ── Shared state ─────────────────────────────────────────────────────────────
-_state_lock = threading.Lock()
-
-_latest_a_packet: dict | None = None
-_latest_b_packet: dict | None = None
-
-_a_received = 0;  _a_dropped = 0
-_b_received = 0;  _b_dropped = 0
-
-_stop_event = threading.Event()
+_state_lock  = threading.Lock()
+_latest_pkt: "dict | None" = None
+_received    = 0
+_dropped     = 0
+_stop_event  = threading.Event()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-def resolve_config() -> str:
-    url = API_URL or os.environ.get("FORWARDER_API_URL")
-    if not url:
-        raise SystemExit("API_URL is not set. Edit the script or set FORWARDER_API_URL.")
-    return url
-
-
-def epoch_to_iso(t: float) -> str:
-    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── Packet reader ─────────────────────────────────────────────────────────────
+# ── Packet parser ─────────────────────────────────────────────────────────────
 
-def read_id(raw: bytes, offset: int) -> tuple[str, int]:
-    """Read a length-prefixed UTF-8 ID string. Returns (id, new_offset)."""
-    (id_len,) = struct.unpack_from("<H", raw, offset)
-    offset += 2
-    return raw[offset : offset + id_len].decode("utf-8"), offset + id_len
-
-
-def parse_combined_packet(raw: bytes, addr) -> "dict | None":
+def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
     """
-    Parse a self-describing bus+PV packet.
-    IDs and names come directly from the packet — no lookup tables needed.
+    Decode Jeewon's raw 150-float UDP packet into the API POST schema.
+
+    Returns None and logs a warning if the packet is the wrong size or
+    cannot be unpacked.
     """
-    if len(raw) < HEADER_BYTES:
-        log.warning(f"Bad packet from {addr}: {len(raw)} bytes < header {HEADER_BYTES}")
+    if len(raw) != PACKET_BYTES:
+        log.warning(
+            f"Bad packet from {addr}: expected {PACKET_BYTES} bytes, got {len(raw)}"
+        )
         return None
 
     try:
-        ts_s, n_buses, n_pvs = struct.unpack_from(HEADER_FMT, raw, 0)
-        offset = HEADER_BYTES
-
-        devices = []
-        for _ in range(n_buses):
-            bus_id, offset = read_id(raw, offset)
-            v, ap, rp, f0, f1, f2 = struct.unpack_from(BUS_FMT, raw, offset)
-            offset += BUS_BYTES
-            devices.append({
-                "id":             bus_id,
-                "voltage":        v,
-                "active power":   ap,
-                "reactive power": rp,
-                "faces":          [f0, f1, f2],
-            })
-
-        pvsystems = []
-        for _ in range(n_pvs):
-            pv_id, offset = read_id(raw, offset)
-            ap, rp = struct.unpack_from(PV_FMT, raw, offset)
-            offset += PV_BYTES
-            pvsystems.append({
-                "id":             pv_id,
-                "active power":   ap,
-                "reactive power": rp,
-            })
-
-    except (struct.error, UnicodeDecodeError, IndexError) as e:
-        log.warning(f"Bad packet from {addr}: {e}")
+        floats = struct.unpack(FLOATS_FMT, raw)
+    except struct.error as e:
+        log.warning(f"Unpack error from {addr}: {e}")
         return None
 
-    if offset != len(raw):
-        log.warning(f"Packet from {addr}: {len(raw) - offset} unexpected trailing bytes")
+    # Each group is 5 consecutive floats: [VA, VB, VC, active_power, reactive_power]
+    def group(g: int):
+        base = g * 5
+        return floats[base], floats[base+1], floats[base+2], floats[base+3], floats[base+4]
+
+    devices = []
+    for g_idx, bus_id in BUS_GROUPS:
+        va, vb, vc, ap, rp = group(g_idx)
+        voltage = (va + vb + vc) / 3.0
+        devices.append({
+            "id":             bus_id,
+            "voltage":        round(voltage, 6),
+            "active power":   round(ap, 4),
+            "reactive power": round(rp, 4),
+            "faces":          [round(va, 6), round(vb, 6), round(vc, 6)],
+        })
+
+    pvsystems = []
+    for g_idx, pv_id in PV_GROUPS:
+        _va, _vb, _vc, ap, rp = group(g_idx)
+        pvsystems.append({
+            "id":             pv_id,
+            "active power":   round(ap, 4),
+            "reactive power": round(rp, 4),
+        })
 
     return {
-        "timestamp": epoch_to_iso(ts_s),
+        "timestamp": now_iso(),
         "devices":   devices,
         "PVSystems": pvsystems,
+        # No "Loads" key — Jeewon's format does not include load data
     }
 
 
 # ── UDP receiver loop ────────────────────────────────────────────────────────
 
-def udp_receiver(port: int, topic: str) -> None:
-    global _latest_a_packet, _latest_b_packet
-    global _a_received, _a_dropped, _b_received, _b_dropped
+def udp_receiver() -> None:
+    global _latest_pkt, _received, _dropped
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((UDP_HOST, port))
+    sock.bind((UDP_HOST, UDP_PORT))
     sock.settimeout(0.5)
-    log.info(f"UDP listener bound to {UDP_HOST}:{port} ({topic})")
+    log.info(f"UDP listener bound to {UDP_HOST}:{UDP_PORT}")
 
     while not _stop_event.is_set():
         try:
@@ -177,34 +179,28 @@ def udp_receiver(port: int, topic: str) -> None:
         except socket.timeout:
             continue
         except OSError as e:
-            log.error(f"UDP {topic} socket error: {e}")
+            log.error(f"Socket error: {e}")
             continue
 
-        parsed = parse_combined_packet(raw, addr)
+        parsed = parse_jeewon_packet(raw, addr)
         if parsed is None:
             continue
 
         with _state_lock:
-            if topic == "a":
-                if _latest_a_packet is not None:
-                    _a_dropped += 1
-                _latest_a_packet = parsed
-                _a_received += 1
-            else:
-                if _latest_b_packet is not None:
-                    _b_dropped += 1
-                _latest_b_packet = parsed
-                _b_received += 1
+            if _latest_pkt is not None:
+                _dropped += 1
+            _latest_pkt = parsed
+            _received  += 1
 
     sock.close()
 
 
 # ── POST logic ───────────────────────────────────────────────────────────────
 
-def post_payload(url: str, payload: dict) -> None:
+def post_payload(payload: dict) -> None:
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, method="POST",
+    req  = urllib.request.Request(
+        API_URL, data=body, method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -222,8 +218,8 @@ def post_payload(url: str, payload: dict) -> None:
         log.warning("POST timed out")
 
 
-def post_timer(api_url: str) -> None:
-    global _latest_a_packet, _latest_b_packet
+def post_timer() -> None:
+    global _latest_pkt
 
     next_tick = time.monotonic() + POST_INTERVAL_S
     while not _stop_event.is_set():
@@ -234,53 +230,34 @@ def post_timer(api_url: str) -> None:
         next_tick += POST_INTERVAL_S
 
         with _state_lock:
-            pkt_a = _latest_a_packet
-            pkt_b = _latest_b_packet
-            _latest_a_packet = None
-            _latest_b_packet = None
-            ar, ad = _a_received, _a_dropped
-            br, bd = _b_received, _b_dropped
+            pkt = _latest_pkt
+            _latest_pkt = None
+            rx, dr = _received, _dropped
 
-        if pkt_a is None and pkt_b is None:
-            log.info("Tick: no new packets on either port")
+        if pkt is None:
+            log.info("Tick: no new packet since last POST")
             continue
 
-        # Merge: A's lists first, then B's. IDs came from the sender so there's
-        # nothing to remap here.
-        all_devices   = []
-        all_pvsystems = []
-        for pkt in (pkt_a, pkt_b):
-            if pkt:
-                all_devices.extend(pkt["devices"])
-                all_pvsystems.extend(pkt["PVSystems"])
-
-        payload: dict = {}
-        if all_devices:
-            payload["devices"] = all_devices
-        if all_pvsystems:
-            payload["PVSystems"] = all_pvsystems
-
-        ts_candidates = [p["timestamp"] for p in (pkt_a, pkt_b) if p and p.get("timestamp")]
-        payload["timestamp"] = max(ts_candidates) if ts_candidates else now_iso()
-
         log.info(
-            f"Tick: portA={ar}r/{ad}d  portB={br}r/{bd}d  "
-            f"buses={len(all_devices)}  pvs={len(all_pvsystems)}"
+            f"Tick: rx={rx}  dropped={dr}  "
+            f"buses={len(pkt['devices'])}  pvs={len(pkt['PVSystems'])}"
         )
-        post_payload(api_url, payload)
+        post_payload(pkt)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    api_url = resolve_config()
-    log.info(f"Forwarding to {api_url}")
-    log.info(f"POST interval: {POST_INTERVAL_S} seconds")
+    if not API_URL:
+        raise SystemExit("API_URL is not set. Edit the script or set FORWARDER_API_URL.")
 
-    threading.Thread(target=udp_receiver, args=(PORT_A, "a"), daemon=True).start()
-    threading.Thread(target=udp_receiver, args=(PORT_B, "b"), daemon=True).start()
+    log.info(f"Forwarding to {API_URL}")
+    log.info(f"Expecting {PACKET_BYTES}-byte packets (150 floats) on port {UDP_PORT}")
+    log.info(f"POST interval: {POST_INTERVAL_S} s  |  "
+             f"{len(BUS_GROUPS)} buses  |  {len(PV_GROUPS)} PV systems")
 
-    post_timer(api_url)
+    threading.Thread(target=udp_receiver, daemon=True).start()
+    post_timer()
 
 
 if __name__ == "__main__":
