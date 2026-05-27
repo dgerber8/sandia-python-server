@@ -36,12 +36,36 @@ import json
 import logging
 import os
 import socket
+import ssl
 import struct
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+
+# ── SSL context ───────────────────────────────────────────────────────────────
+# On restricted Windows lab machines the network proxy re-signs TLS with an
+# institutional CA that lives in the Windows cert store but not in Python's
+# bundled store.  Resolution order:
+#   1. truststore  — makes Python use the Windows/macOS/Linux system store
+#   2. certifi     — ships its own Mozilla CA bundle
+#   3. default ssl — whatever Python has built-in
+# Set FORWARDER_NO_SSL_VERIFY=1 to skip verification entirely (demo fallback).
+_NO_VERIFY = os.environ.get("FORWARDER_NO_SSL_VERIFY", "").strip() == "1"
+
+if _NO_VERIFY:
+    _SSL_CTX = ssl._create_unverified_context()
+else:
+    try:
+        import truststore
+        _SSL_CTX = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        try:
+            import certifi
+            _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            _SSL_CTX = ssl.create_default_context()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_URL = os.environ.get(
@@ -204,7 +228,7 @@ def post_payload(payload: dict) -> None:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S, context=_SSL_CTX) as resp:
             status = resp.status
             if status >= 300:
                 log.warning(f"API returned {status}: {resp.read()[:200]!r}")
