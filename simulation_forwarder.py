@@ -1,23 +1,24 @@
 """
-Jeewon Forwarder — raw 150-float UDP → API Gateway
+Jeewon Forwarder — raw 153-float UDP → API Gateway
 ====================================================
 
 Listens on a single UDP port for Jeewon's simulation output, decodes the
-fixed-layout 150-float payload, and POSTs a merged snapshot to the API
+fixed-layout 153-float payload, and POSTs a merged snapshot to the API
 Gateway every POST_INTERVAL_S seconds.
 
 Packet format (from Jeewon's model, port 5005):
-    600 bytes — 150 native-endian floats, NO header, NO IDs.
-    struct.unpack('150f', data)
+    612 bytes — 153 native-endian floats, NO header, NO IDs.
+    struct.unpack('153f', data)
 
     30 groups × 5 floats each: [VA, VB, VC, active_power, reactive_power]
+    + 3 trailing floats:        [active_power, reactive_power, (reserved)]
 
     Groups 0–20  → 21 buses (bus01–bus19, bus21, bus22 — note: bus20 absent)
     Groups 21–29 → 9 PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
+    Floats 150–151 → Load.LOAD748 (active power, reactive power)
 
 Bus voltage reported to the API is mean(VA, VB, VC).
 Faces [VA, VB, VC] are forwarded as-is.
-No Loads in Jeewon's format — the "Loads" key is omitted from the POST.
 
 POST tick (every POST_INTERVAL_S):
     - Grabs the latest parsed snapshot.
@@ -80,10 +81,10 @@ HTTP_TIMEOUT_S  = 5
 POST_INTERVAL_S = 5.0
 
 # ── Fixed packet layout ───────────────────────────────────────────────────────
-# 150 native-endian single-precision floats, 600 bytes total, no header.
-FLOAT_COUNT   = 150
-PACKET_BYTES  = FLOAT_COUNT * struct.calcsize("f")  # 600
-FLOATS_FMT    = f"{FLOAT_COUNT}f"                   # '150f'  (native endian)
+# 153 native-endian single-precision floats, 612 bytes total, no header.
+FLOAT_COUNT   = 153
+PACKET_BYTES  = FLOAT_COUNT * struct.calcsize("f")  # 612
+FLOATS_FMT    = f"{FLOAT_COUNT}f"                   # '153f'  (native endian)
 
 # Bus group mapping: group index → API bus ID
 # Groups 0–18: bus01–bus19; groups 19–20: bus21–bus22 (bus20 is absent)
@@ -109,6 +110,12 @@ PV_GROUPS = [
     (27, "PVSystem.PVSY291"),
     (28, "PVSystem.PVSY315"),
     (29, "PVSystem.PVSY297"),
+]
+
+# Load layout: (float_index_of_active_power, load_id)
+# Floats 150–152 = active power, reactive power, voltage.
+LOAD_ENTRIES = [
+    (150, "Load.LOAD748"),
 ]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -179,11 +186,23 @@ def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
             "reactive power": round(rp, 4),
         })
 
+    loads = []
+    for ap_idx, load_id in LOAD_ENTRIES:
+        ap      = floats[ap_idx]
+        rp      = floats[ap_idx + 1]
+        voltage = floats[ap_idx + 2]
+        loads.append({
+            "active power":   round(ap, 4),
+            "reactive power": round(rp, 4),
+            "voltage":        round(voltage, 6),
+            "id":             load_id,
+        })
+
     return {
         "timestamp": now_iso(),
         "devices":   devices,
         "PVSystems": pvsystems,
-        # No "Loads" key — Jeewon's format does not include load data
+        "Loads":     loads,
     }
 
 
@@ -264,7 +283,8 @@ def post_timer() -> None:
 
         log.info(
             f"Tick: rx={rx}  dropped={dr}  "
-            f"buses={len(pkt['devices'])}  pvs={len(pkt['PVSystems'])}"
+            f"buses={len(pkt['devices'])}  pvs={len(pkt['PVSystems'])}  "
+            f"loads={len(pkt['Loads'])}"
         )
         post_payload(pkt)
 
@@ -276,9 +296,10 @@ def main() -> None:
         raise SystemExit("API_URL is not set. Edit the script or set FORWARDER_API_URL.")
 
     log.info(f"Forwarding to {API_URL}")
-    log.info(f"Expecting {PACKET_BYTES}-byte packets (150 floats) on port {UDP_PORT}")
+    log.info(f"Expecting {PACKET_BYTES}-byte packets (153 floats) on port {UDP_PORT}")
     log.info(f"POST interval: {POST_INTERVAL_S} s  |  "
-             f"{len(BUS_GROUPS)} buses  |  {len(PV_GROUPS)} PV systems")
+             f"{len(BUS_GROUPS)} buses  |  {len(PV_GROUPS)} PV systems  |  "
+             f"{len(LOAD_ENTRIES)} loads")
 
     threading.Thread(target=udp_receiver, daemon=True).start()
     post_timer()

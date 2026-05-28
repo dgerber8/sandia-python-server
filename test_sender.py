@@ -1,5 +1,5 @@
 """
-Jeewon Test Sender — synthetic 150-float UDP packets
+Jeewon Test Sender — synthetic 153-float UDP packets
 =====================================================
 
 Generates synthetic simulation data in Jeewon's exact raw-float format and
@@ -7,13 +7,15 @@ sends it to localhost:5005 so you can test jeewon_forwarder.py without
 needing her live simulation model.
 
 Packet format (matches Jeewon's model output):
-    600 bytes — 150 native-endian single-precision floats, no header.
-    struct.unpack('150f', data)
+    612 bytes — 153 native-endian single-precision floats, no header.
+    struct.unpack('153f', data)
 
     30 groups × 5 floats: [VA, VB, VC, active_power, reactive_power]
+    + 3 trailing floats:  [active_power, reactive_power, (reserved)]
 
-    Groups 0–20  → 21 buses (bus01–bus19, bus21, bus22)
-    Groups 21–29 → 9 PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
+    Groups 0–20   → 21 buses (bus01–bus19, bus21, bus22)
+    Groups 21–29  → 9 PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
+    Floats 150–151 → Load.LOAD748 (active power, reactive power)
 
 Synthetic values:
     Voltages (per-phase, per-unit): ~1.00 pu with ±0.05 pu cyclic swing
@@ -39,8 +41,8 @@ UDP_HOST = "127.0.0.1"
 UDP_PORT = 5005
 
 # ── Packet constant ────────────────────────────────────────────────────────────
-FLOAT_COUNT = 150
-FLOATS_FMT  = f"{FLOAT_COUNT}f"   # '150f' — native endian, matches Jeewon's unpack
+FLOAT_COUNT = 153
+FLOATS_FMT  = f"{FLOAT_COUNT}f"   # '153f' — native endian, matches Jeewon's unpack
 
 # ── Fixed layout (must stay in sync with jeewon_forwarder.py) ─────────────────
 # 30 entries total; each is (group_index, label) for documentation only.
@@ -58,6 +60,11 @@ PV_LAYOUT = [
     (21, "PVSystem.bus04"), (22, "PVSystem.bus05"), (23, "PVSystem.bus06"),
     (24, "PVSystem.bus08"), (25, "PVSystem.bus09"), (26, "PVSystem.bus10"),
     (27, "PVSystem.bus13"), (28, "PVSystem.bus21"), (29, "PVSystem.bus22"),
+]
+
+# Trailing floats 150–152: Load.LOAD748 [active_power, reactive_power, voltage]
+LOAD_LAYOUT = [
+    (150, "Load.LOAD748"),
 ]
 
 assert len(BUS_LAYOUT) + len(PV_LAYOUT) == 30, "layout must have exactly 30 groups"
@@ -102,11 +109,26 @@ def _pv_reactive_power(t: float, pv_idx: int) -> float:
     return _pv_active_power(t, pv_idx) * 0.10
 
 
+def _load_active_power(t: float) -> float:
+    """Active power consumed by Load.LOAD748 (W). Slow sinusoidal variation."""
+    return 190.0 + 15.0 * math.sin(2 * math.pi * t / 60.0)
+
+
+def _load_reactive_power(t: float) -> float:
+    """Reactive power for Load.LOAD748 (VAR)."""
+    return 51.0 + 5.0 * math.cos(2 * math.pi * t / 60.0)
+
+
+def _load_voltage(t: float) -> float:
+    """Voltage at Load.LOAD748 (per-unit). Slow sinusoidal swing ±0.02 pu."""
+    return 1.0 + 0.02 * math.sin(2 * math.pi * t / 60.0)
+
+
 # ── Packet builder ────────────────────────────────────────────────────────────
 
 def build_packet(t: float) -> bytes:
     """
-    Build one 600-byte packet of 150 native floats for wall-clock time `t`.
+    Build one 612-byte packet of 153 native floats for wall-clock time `t`.
     """
     floats: list[float] = [0.0] * FLOAT_COUNT
 
@@ -128,6 +150,11 @@ def build_packet(t: float) -> bytes:
         ap = _pv_active_power(t, pv_seq)
         rp = _pv_reactive_power(t, pv_seq)
         floats[base : base + 5] = [va, vb, vc, ap, rp]
+
+    for ap_idx, _label in LOAD_LAYOUT:
+        floats[ap_idx]     = _load_active_power(t)
+        floats[ap_idx + 1] = _load_reactive_power(t)
+        floats[ap_idx + 2] = _load_voltage(t)
 
     return struct.pack(FLOATS_FMT, *floats)
 
@@ -154,7 +181,7 @@ def main() -> None:
     print(f"  Target  : {target[0]}:{target[1]}")
     print(f"  Rate    : {rate} Hz  |  Duration: {duration} s  |  Packets: {total}")
     print(f"  Payload : {FLOAT_COUNT * 4} bytes ({FLOAT_COUNT} floats, no header)")
-    print(f"  Layout  : {len(BUS_LAYOUT)} bus groups + {len(PV_LAYOUT)} PV groups")
+    print(f"  Layout  : {len(BUS_LAYOUT)} bus groups + {len(PV_LAYOUT)} PV groups + {len(LOAD_LAYOUT)} load(s)")
     print(f"  Forwarder POSTs every 5 s → expect ~{int(duration // 5)} API calls\n")
 
     start     = time.monotonic()
@@ -177,7 +204,7 @@ def main() -> None:
     sock.close()
     print(f"\nDone. {total} packets sent in {time.monotonic() - start:.1f} s.")
     print("Check DynamoDB for new records — each should have "
-          f"{len(BUS_LAYOUT)} devices and {len(PV_LAYOUT)} PVSystems.")
+          f"{len(BUS_LAYOUT)} devices, {len(PV_LAYOUT)} PVSystems, and {len(LOAD_LAYOUT)} load(s).")
 
 
 if __name__ == "__main__":
