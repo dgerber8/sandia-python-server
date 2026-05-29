@@ -80,6 +80,7 @@ UDP_PORT        = 5005
 UDP_BUFFER_SIZE = 65535
 HTTP_TIMEOUT_S  = 5
 POST_INTERVAL_S = 5.0
+LOG_LEVEL       = logging.DEBUG   # change to logging.INFO to silence packet-level logs
 
 # ── Fixed packet layout ───────────────────────────────────────────────────────
 # 244 native-endian single-precision floats, 976 bytes total, no header.
@@ -104,12 +105,12 @@ BUS_GROUPS = [
 PV_GROUPS = [
     (21, "PVSystem.PVSY315"), #4
     (22, "PVSystem.PVSY309"), #5
-    (23, "PVSystem.PVSY312"), #6
+    (23, "PVSystem.PVSY312"), #6 DUMMY (overload)
     (24, "PVSystem.PVSY321"), #8
-    (25, "PVSystem.PVSY300"), #9
+    (25, "PVSystem.PVSY300"), #9 DUMMY (overload)
     (26, "PVSystem.PVSY318"), #10
     (27, "PVSystem.PVSY297"), #13
-    (28, "PVSystem.PVSY35"), #21
+    (28, "PVSystem.PVSY35"), #21 DUMMY (overload)
     (29, "PVSystem.PVSY19"), #22
 ]
 
@@ -149,6 +150,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("jeewon_forwarder")
+log.setLevel(LOG_LEVEL)
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 _state_lock  = threading.Lock()
@@ -168,14 +170,18 @@ def now_iso() -> str:
 
 def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
     """
-    Decode Jeewon's raw 150-float UDP packet into the API POST schema.
+    Decode Jeewon's raw UDP packet into the API POST schema.
 
     Returns None and logs a warning if the packet is the wrong size or
     cannot be unpacked.
     """
+    # ── Size check ────────────────────────────────────────────────────────────
     if len(raw) != PACKET_BYTES:
         log.warning(
-            f"Bad packet from {addr}: expected {PACKET_BYTES} bytes, got {len(raw)}"
+            f"Bad packet from {addr}: expected {PACKET_BYTES} bytes "
+            f"({FLOAT_COUNT} floats), got {len(raw)} bytes "
+            f"({len(raw) // 4} floats if 4-byte aligned). "
+            f"Packet dropped — update FLOAT_COUNT if the layout changed."
         )
         return None
 
@@ -184,6 +190,19 @@ def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
     except struct.error as e:
         log.warning(f"Unpack error from {addr}: {e}")
         return None
+
+    log.debug(f"Packet OK: {len(raw)} bytes, {len(floats)} floats from {addr}")
+
+    # ── Boundary spot-check (logged at DEBUG so it doesn't flood INFO) ────────
+    # Last PV group ends at float 149; first 5F load starts at float 150.
+    last_pv_ap  = floats[149]   # reactive power of last PV group (group 29)
+    first_load  = floats[150:155]
+    first_3f    = floats[235:238]
+    log.debug(
+        f"Boundary check | last PV[149]={last_pv_ap:.4f} | "
+        f"load5F[150-154]={[round(v,4) for v in first_load]} | "
+        f"load3F[235-237]={[round(v,4) for v in first_3f]}"
+    )
 
     # Each group is 5 consecutive floats: [VA, VB, VC, active_power, reactive_power]
     def group(g: int):
@@ -215,6 +234,10 @@ def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
     for g_idx, load_id in LOAD_GROUPS:
         va, vb, vc, ap, rp = group(g_idx)
         voltage = (va + vb + vc) / 3.0
+        log.debug(
+            f"  5F load {load_id} (group {g_idx}, floats {g_idx*5}-{g_idx*5+4}): "
+            f"AP={ap:.4f}  RP={rp:.4f}  V={voltage:.6f}"
+        )
         loads.append({
             "active power":   round(ap, 4),
             "reactive power": round(rp, 4),
@@ -225,12 +248,26 @@ def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
         ap      = floats[f_idx]
         rp      = floats[f_idx + 1]
         voltage = floats[f_idx + 2]
+        log.debug(
+            f"  3F load {load_id} (floats {f_idx}-{f_idx+2}): "
+            f"AP={ap:.4f}  RP={rp:.4f}  V={voltage:.6f}"
+        )
         loads.append({
             "active power":   round(ap, 4),
             "reactive power": round(rp, 4),
             "voltage":        round(voltage, 6),
             "id":             load_id,
         })
+
+    # ── Sanity check: warn if all load AP values are zero ─────────────────────
+    if all(l["active power"] == 0.0 for l in loads):
+        log.warning(
+            "All load active-power values are 0.0 — the load section of the "
+            "packet may be misaligned. "
+            f"Expected load data starting at float 150 (byte {150*4}). "
+            f"Actual packet is {len(raw)} bytes ({len(raw)//4} floats). "
+            "Check that Jeewon's layout matches LOAD_GROUPS / LOAD_GROUPS_3F."
+        )
 
     return {
         "timestamp": now_iso(),
