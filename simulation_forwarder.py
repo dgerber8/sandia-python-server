@@ -7,14 +7,16 @@ fixed-layout 260-float payload, and POSTs a merged snapshot to the API
 Gateway every POST_INTERVAL_S seconds.
 
 Packet format (from Jeewon's model, port 5005):
-    1020 bytes — 255 native-endian floats, NO header, NO IDs.
-    struct.unpack('255f', data)
+    976 bytes — 244 native-endian floats, NO header, NO IDs.
+    struct.unpack('244f', data)
 
-    51 groups × 5 floats each: [VA, VB, VC, active_power, reactive_power]
+    Groups 0–46  × 5 floats: [VA, VB, VC, active_power, reactive_power]
+    Floats 235–243 × 3 floats: [active_power, reactive_power, voltage]
 
-    Groups 0–20  → 21 buses  (bus01–bus19, bus21, bus22 — note: bus20 absent)
-    Groups 21–29 → 9  PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
-    Groups 30–50 → 21 loads  (b_1–b_19, b_21–b_22 — note: b_20 absent)
+    Groups 0–20   → 21 buses  (bus01–bus19, bus21, bus22 — note: bus20 absent)
+    Groups 21–29  → 9  PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
+    Groups 30–46  → 17 loads  with per-phase voltages (b_1–b_17)
+    Floats 235–243 → 3  loads  without per-phase voltages (b_18, b_19, b_21)
 
 Bus/load voltage reported to the API is mean(VA, VB, VC).
 Faces [VA, VB, VC] are forwarded as-is for buses.
@@ -80,10 +82,10 @@ HTTP_TIMEOUT_S  = 5
 POST_INTERVAL_S = 5.0
 
 # ── Fixed packet layout ───────────────────────────────────────────────────────
-# 255 native-endian single-precision floats, 1020 bytes total, no header.
-FLOAT_COUNT   = 255
-PACKET_BYTES  = FLOAT_COUNT * struct.calcsize("f")  # 1020
-FLOATS_FMT    = f"{FLOAT_COUNT}f"                   # '255f'  (native endian)
+# 244 native-endian single-precision floats, 976 bytes total, no header.
+FLOAT_COUNT   = 244
+PACKET_BYTES  = FLOAT_COUNT * struct.calcsize("f")  # 976
+FLOATS_FMT    = f"{FLOAT_COUNT}f"                   # '244f'  (native endian)
 
 # Bus group mapping: group index → API bus ID
 # Groups 0–18: bus01–bus19; groups 19–20: bus21–bus22 (bus20 is absent)
@@ -111,8 +113,8 @@ PV_GROUPS = [
     (29, "PVSystem.PVSY19"), #22
 ]
 
-# Load group mapping: group index → load ID (same 5-float layout as buses/PVs)
-# Groups 30–50: b_1–b_19, b_21–b_22 (b_20 absent, matching Jeewon's bus layout).
+# Load group mapping: group index → load ID (5-float layout: VA, VB, VC, AP, RP)
+# Groups 30–46: b_1–b_17 (b_18, b_19, b_21 use 3-float layout below).
 LOAD_GROUPS = [
     (30, "Load.LOAD1681"),  # b_1
     (31, "Load.LOAD1680"),  # b_2
@@ -131,10 +133,14 @@ LOAD_GROUPS = [
     (44, "Load.LOAD1682"),  # b_15
     (45, "Load.LOAD1684"),  # b_16
     (46, "Load.LOAD1685"),  # b_17
-    (47, "Load.LOAD1676"),  # b_18
-    (48, "Load.LOAD1675"),  # b_19
-    (49, "Load.LOAD1683"),  # b_21
-    (50, "Load.LOAD748"),   # b_22
+]
+
+# 3-float loads: (float_start_index, load_id) — layout: [active_power, reactive_power, voltage]
+# No per-phase voltages; follow immediately after the 5-float load groups (group 46 ends at float 234).
+LOAD_GROUPS_3F = [
+    (235, "Load.LOAD1676"),  # b_18
+    (238, "Load.LOAD1675"),  # b_19
+    (241, "Load.LOAD1683"),  # b_21
 ]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -209,6 +215,16 @@ def parse_jeewon_packet(raw: bytes, addr) -> "dict | None":
     for g_idx, load_id in LOAD_GROUPS:
         va, vb, vc, ap, rp = group(g_idx)
         voltage = (va + vb + vc) / 3.0
+        loads.append({
+            "active power":   round(ap, 4),
+            "reactive power": round(rp, 4),
+            "voltage":        round(voltage, 6),
+            "id":             load_id,
+        })
+    for f_idx, load_id in LOAD_GROUPS_3F:
+        ap      = floats[f_idx]
+        rp      = floats[f_idx + 1]
+        voltage = floats[f_idx + 2]
         loads.append({
             "active power":   round(ap, 4),
             "reactive power": round(rp, 4),

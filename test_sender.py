@@ -40,8 +40,8 @@ UDP_HOST = "127.0.0.1"
 UDP_PORT = 5005
 
 # ── Packet constant ────────────────────────────────────────────────────────────
-FLOAT_COUNT = 255
-FLOATS_FMT  = f"{FLOAT_COUNT}f"   # '255f' — native endian, matches Jeewon's unpack
+FLOAT_COUNT = 244
+FLOATS_FMT  = f"{FLOAT_COUNT}f"   # '244f' — native endian, matches Jeewon's unpack
 
 # ── Fixed layout (must stay in sync with jeewon_forwarder.py) ─────────────────
 # 30 entries total; each is (group_index, label) for documentation only.
@@ -61,7 +61,7 @@ PV_LAYOUT = [
     (27, "PVSystem.bus13"), (28, "PVSystem.bus21"), (29, "PVSystem.bus22"),
 ]
 
-# Groups 30–50: 21 loads (b_1–b_19, b_21–b_22) — same 5-float layout as buses/PVs
+# Groups 30–46: 17 loads with 5-float layout (VA, VB, VC, AP, RP)
 LOAD_LAYOUT = [
     (30, "Load.LOAD1681"),  # b_1
     (31, "Load.LOAD1680"),  # b_2
@@ -80,10 +80,13 @@ LOAD_LAYOUT = [
     (44, "Load.LOAD1682"),  # b_15
     (45, "Load.LOAD1684"),  # b_16
     (46, "Load.LOAD1685"),  # b_17
-    (47, "Load.LOAD1676"),  # b_18
-    (48, "Load.LOAD1675"),  # b_19
-    (49, "Load.LOAD1683"),  # b_21
-    (50, "Load.LOAD748"),   # b_22
+]
+
+# 3-float loads: (float_start_index, load_id) — layout: [AP, RP, voltage]
+LOAD_LAYOUT_3F = [
+    (235, "Load.LOAD1676"),  # b_18
+    (238, "Load.LOAD1675"),  # b_19
+    (241, "Load.LOAD1683"),  # b_21
 ]
 
 assert len(BUS_LAYOUT) + len(PV_LAYOUT) == 30, "layout must have exactly 30 groups"
@@ -144,7 +147,7 @@ def _load_reactive_power(t: float, load_idx: int) -> float:
 
 def build_packet(t: float) -> bytes:
     """
-    Build one 1040-byte packet of 260 native floats for wall-clock time `t`.
+    Build one 996-byte packet of 249 native floats for wall-clock time `t`.
     """
     floats: list[float] = [0.0] * FLOAT_COUNT
 
@@ -175,6 +178,12 @@ def build_packet(t: float) -> bytes:
         ap = _load_active_power(t, load_seq)
         rp = _load_reactive_power(t, load_seq)
         floats[base : base + 5] = [va, vb, vc, ap, rp]
+
+    for load_seq, (f_idx, _label) in enumerate(LOAD_LAYOUT_3F):
+        ap      = _load_active_power(t, len(LOAD_LAYOUT) + load_seq)
+        rp      = _load_reactive_power(t, len(LOAD_LAYOUT) + load_seq)
+        voltage = _pu_voltage(t, len(LOAD_LAYOUT) + load_seq, 0)
+        floats[f_idx : f_idx + 3] = [ap, rp, voltage]
 
     return struct.pack(FLOATS_FMT, *floats)
 
