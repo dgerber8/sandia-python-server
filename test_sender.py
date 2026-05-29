@@ -1,5 +1,5 @@
 """
-Jeewon Test Sender — synthetic 155-float UDP packets
+Jeewon Test Sender — synthetic 260-float UDP packets
 =====================================================
 
 Generates synthetic simulation data in Jeewon's exact raw-float format and
@@ -7,14 +7,14 @@ sends it to localhost:5005 so you can test jeewon_forwarder.py without
 needing her live simulation model.
 
 Packet format (matches Jeewon's model output):
-    620 bytes — 155 native-endian single-precision floats, no header.
-    struct.unpack('155f', data)
+    1020 bytes — 255 native-endian single-precision floats, no header.
+    struct.unpack('255f', data)
 
-    31 groups × 5 floats: [VA, VB, VC, active_power, reactive_power]
+    51 groups × 5 floats: [VA, VB, VC, active_power, reactive_power]
 
-    Groups 0–20  → 21 buses (bus01–bus19, bus21, bus22)
-    Groups 21–29 → 9 PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
-    Group  30    → Load.LOAD748
+    Groups 0–20  → 21 buses  (bus01–bus19, bus21, bus22)
+    Groups 21–29 → 9  PV systems (buses 4, 5, 6, 8, 9, 10, 13, 21, 22)
+    Groups 30–50 → 21 loads  (b_1–b_19, b_21–b_22 — b_20 absent)
 
 Synthetic values:
     Voltages (per-phase, per-unit): ~1.00 pu with ±0.05 pu cyclic swing
@@ -40,8 +40,8 @@ UDP_HOST = "127.0.0.1"
 UDP_PORT = 5005
 
 # ── Packet constant ────────────────────────────────────────────────────────────
-FLOAT_COUNT = 155
-FLOATS_FMT  = f"{FLOAT_COUNT}f"   # '155f' — native endian, matches Jeewon's unpack
+FLOAT_COUNT = 255
+FLOATS_FMT  = f"{FLOAT_COUNT}f"   # '255f' — native endian, matches Jeewon's unpack
 
 # ── Fixed layout (must stay in sync with jeewon_forwarder.py) ─────────────────
 # 30 entries total; each is (group_index, label) for documentation only.
@@ -61,9 +61,29 @@ PV_LAYOUT = [
     (27, "PVSystem.bus13"), (28, "PVSystem.bus21"), (29, "PVSystem.bus22"),
 ]
 
-# Group 30: Load.LOAD748 — same 5-float layout as buses/PVs
+# Groups 30–50: 21 loads (b_1–b_19, b_21–b_22) — same 5-float layout as buses/PVs
 LOAD_LAYOUT = [
-    (30, "Load.LOAD748"),
+    (30, "Load.LOAD1681"),  # b_1
+    (31, "Load.LOAD1680"),  # b_2
+    (32, "Load.LOAD1650"),  # b_3
+    (33, "Load.LOAD1687"),  # b_4
+    (34, "Load.LOAD1672"),  # b_5
+    (35, "Load.LOAD1679"),  # b_6
+    (36, "Load.LOAD1668"),  # b_7
+    (37, "Load.LOAD1688"),  # b_8
+    (38, "Load.LOAD1662"),  # b_9
+    (39, "Load.LOAD1686"),  # b_10
+    (40, "Load.LOAD1656"),  # b_11
+    (41, "Load.LOAD1665"),  # b_12
+    (42, "Load.LOAD1659"),  # b_13
+    (43, "Load.LOAD1653"),  # b_14
+    (44, "Load.LOAD1682"),  # b_15
+    (45, "Load.LOAD1684"),  # b_16
+    (46, "Load.LOAD1685"),  # b_17
+    (47, "Load.LOAD1676"),  # b_18
+    (48, "Load.LOAD1675"),  # b_19
+    (49, "Load.LOAD1683"),  # b_21
+    (50, "Load.LOAD748"),   # b_22
 ]
 
 assert len(BUS_LAYOUT) + len(PV_LAYOUT) == 30, "layout must have exactly 30 groups"
@@ -108,21 +128,23 @@ def _pv_reactive_power(t: float, pv_idx: int) -> float:
     return _pv_active_power(t, pv_idx) * 0.10
 
 
-def _load_active_power(t: float) -> float:
-    """Active power consumed by Load.LOAD748 (W). Slow sinusoidal variation."""
-    return 190.0 + 15.0 * math.sin(2 * math.pi * t / 60.0)
+def _load_active_power(t: float, load_idx: int) -> float:
+    """Active power consumed by a load (W). Varies per load index."""
+    base   = 190.0 + load_idx * 10.0
+    ripple = 15.0 * math.sin(2 * math.pi * t / 60.0 + load_idx)
+    return base + ripple
 
 
-def _load_reactive_power(t: float) -> float:
-    """Reactive power for Load.LOAD748 (VAR)."""
-    return 51.0 + 5.0 * math.cos(2 * math.pi * t / 60.0)
+def _load_reactive_power(t: float, load_idx: int) -> float:
+    """Reactive power for a load (VAR). Varies per load index."""
+    return 51.0 + load_idx * 3.0 + 5.0 * math.cos(2 * math.pi * t / 60.0 + load_idx)
 
 
 # ── Packet builder ────────────────────────────────────────────────────────────
 
 def build_packet(t: float) -> bytes:
     """
-    Build one 620-byte packet of 155 native floats for wall-clock time `t`.
+    Build one 1040-byte packet of 260 native floats for wall-clock time `t`.
     """
     floats: list[float] = [0.0] * FLOAT_COUNT
 
@@ -145,12 +167,14 @@ def build_packet(t: float) -> bytes:
         rp = _pv_reactive_power(t, pv_seq)
         floats[base : base + 5] = [va, vb, vc, ap, rp]
 
-    for group_idx, _label in LOAD_LAYOUT:
+    for load_seq, (group_idx, _label) in enumerate(LOAD_LAYOUT):
         base = group_idx * 5
-        va = _pu_voltage(t, group_idx, 0)
-        vb = _pu_voltage(t, group_idx, 1)
-        vc = _pu_voltage(t, group_idx, 2)
-        floats[base : base + 5] = [va, vb, vc, _load_active_power(t), _load_reactive_power(t)]
+        va = _pu_voltage(t, load_seq, 0)
+        vb = _pu_voltage(t, load_seq, 1)
+        vc = _pu_voltage(t, load_seq, 2)
+        ap = _load_active_power(t, load_seq)
+        rp = _load_reactive_power(t, load_seq)
+        floats[base : base + 5] = [va, vb, vc, ap, rp]
 
     return struct.pack(FLOATS_FMT, *floats)
 
