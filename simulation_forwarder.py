@@ -72,7 +72,7 @@ else:
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_URL = os.environ.get(
     "FORWARDER_API_URL",
-    "https://byvtfz9728.execute-api.us-west-1.amazonaws.com/prod/ingest",
+    "https://3e52lhlirb.execute-api.us-east-1.amazonaws.com/prod/ingest",
 )
 
 UDP_HOST        = "0.0.0.0"
@@ -80,7 +80,7 @@ UDP_PORT        = 5005
 UDP_BUFFER_SIZE = 65535
 HTTP_TIMEOUT_S  = 5
 POST_INTERVAL_S = 5.0
-LOG_LEVEL       = logging.DEBUG   # change to logging.INFO to silence packet-level logs
+LOG_LEVEL       = logging.INFO   # change to logging.INFO to silence packet-level logs
 
 # ── Fixed packet layout ───────────────────────────────────────────────────────
 # 244 native-endian single-precision floats, 976 bytes total, no header.

@@ -18,8 +18,8 @@ Packet format (matches Jeewon's model output):
 
 Synthetic values:
     Voltages (per-phase, per-unit): ~1.00 pu with ±0.05 pu cyclic swing
-    Bus active power:               ~1900 W/bus with slow drift
-    Bus reactive power:             ~200 VAR/bus
+    Bus active power:               0.5–0.8 MW (500 000–800 000 W) with slow drift
+    Bus reactive power:             1.5–2.0 MVAR (1 500 000–2 000 000 VAR)
     PV active power:                ~500 W  (rises when voltage is high,
                                             drops toward 0 at night-sim)
     PV reactive power:              ~50 VAR
@@ -108,15 +108,25 @@ def _pu_voltage(t: float, bus_idx: int, phase: int) -> float:
 
 
 def _bus_active_power(t: float, bus_idx: int) -> float:
-    """Active power drawn by a bus (W). Ramps up over the day, ±150 W ripple."""
-    base   = 1900.0 + bus_idx * 50.0
-    ripple = 150.0 * math.sin(2 * math.pi * t / 30.0 + bus_idx)
+    """
+    Active power for a bus (W).
+    Target display range: 0.5–0.8 MW → 500 000–800 000 W.
+    Centre ~650 000 W with ±100 000 W ripple and a small per-bus spread.
+    """
+    base   = 650_000.0 + bus_idx * 5_000.0
+    ripple = 100_000.0 * math.sin(2 * math.pi * t / 30.0 + bus_idx)
     return base + ripple
 
 
 def _bus_reactive_power(t: float, bus_idx: int) -> float:
-    """Reactive power for a bus (VAR)."""
-    return 200.0 + bus_idx * 10.0 + 20.0 * math.cos(2 * math.pi * t / 45.0)
+    """
+    Reactive power for a bus (VAR).
+    Target display range: 1.5–2.0 MVAR → 1 500 000–2 000 000 VAR.
+    Centre ~1 750 000 VAR with ±150 000 VAR ripple and a small per-bus spread.
+    """
+    base   = 1_750_000.0 + bus_idx * 10_000.0
+    ripple = 150_000.0 * math.cos(2 * math.pi * t / 45.0)
+    return base + ripple
 
 
 def _pv_active_power(t: float, pv_idx: int) -> float:
@@ -211,6 +221,8 @@ def main() -> None:
     print(f"  Rate    : {rate} Hz  |  Duration: {duration} s  |  Packets: {total}")
     print(f"  Payload : {FLOAT_COUNT * 4} bytes ({FLOAT_COUNT} floats, no header)")
     print(f"  Layout  : {len(BUS_LAYOUT)} bus groups + {len(PV_LAYOUT)} PV groups + {len(LOAD_LAYOUT)} load(s)")
+    print(f"  Bus AP  : ~650 000 W ± 100 000 W  (0.55–0.75 MW)")
+    print(f"  Bus RP  : ~1 750 000 VAR ± 150 000 VAR  (1.6–1.9 MVAR)")
     print(f"  Forwarder POSTs every 5 s → expect ~{int(duration // 5)} API calls\n")
 
     start     = time.monotonic()

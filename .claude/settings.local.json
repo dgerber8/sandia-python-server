@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import test_sender; pkt = test_sender.build_packet\\(0.0\\); print\\('packet bytes:', len\\(pkt\\)\\); import struct; floats = struct.unpack\\('153f', pkt\\); print\\('load AP:', round\\(floats[150], 4\\), 'load RP:', round\\(floats[151], 4\\), 'reserved:', floats[152]\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
